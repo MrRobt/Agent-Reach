@@ -8,24 +8,75 @@
 
 ### 后端 A：OpenCLI（桌面首选，复用浏览器登录态）
 
-```bash
-# 搜索笔记
-opencli xiaohongshu search "query" -f yaml
+> **实测版本**: OpenCLI v1.8.6(2026-07)。`opencli xiaohongshu` 子命令比文档其他平台更丰富,核心是 `creator-profile` / `creator-notes` / `creator-stats` 系列。命令分类见下。
 
-# 读笔记正文+互动数据（用搜索结果里的完整 URL，含 xsec_token）
+#### 基础读取（任意账号 / 公开数据）
+
+```bash
+# 搜索笔记（默认 20 条，--limit 调整；不要用 -n，opencli 用 --limit）
+opencli xiaohongshu search "query" --limit 20 -f yaml
+
+# 读笔记正文+互动数据（必须用搜索结果里的完整 URL，含 xsec_token）
 opencli xiaohongshu note "NOTE_URL" -f yaml
 
-# 评论（支持楼中楼）
+# 评论（支持楼中楼子回复）
 opencli xiaohongshu comments NOTE_ID -f yaml
 
-# 首页推荐 feed
+# 首页推荐 Feed（reads hydrated Pinia store）
 opencli xiaohongshu feed -f yaml
 
-# 用户主页公开笔记
-opencli xiaohongshu user USER_ID -f yaml
+# 用户主页公开笔记（id 或完整 profile URL 都接受）
+opencli xiaohongshu user "USER_ID_OR_URL" --limit 15 -f yaml
+
+# 标记当前登录账号
+opencli xiaohongshu whoami -f yaml
+```
+
+#### 创作者中心 ★（当前登录账号的私有数据，需登录态）
+
+> 这正是用户最初要的"主页粉丝/关注/获赞/笔记列表"全套能力。`creator-*` 系列读的是**当前登录账号**自己的创作者中心数据，**不是**任意账号的数据。
+
+```bash
+# 创作者账号信息：粉丝 / 关注 / 获赞 / 成长等级 / 等级进度
+opencli xiaohongshu creator-profile -f yaml
+
+# 创作者笔记列表 + 每篇数据（标题 / 日期 / 观看 / 点赞 / 收藏 / 评论）
+opencli xiaohongshu creator-notes -f yaml
+
+# 创作者数据总览（观看 / 点赞 / 收藏 / 评论 / 分享 / 涨粉，含每日趋势）
+opencli xiaohongshu creator-stats -f yaml
+
+# 单篇笔记详情（笔记信息 + 核心/互动数据 + 观看来源 + 观众画像 + 趋势）
+opencli xiaohongshu creator-note-detail NOTE_ID -f yaml
+
+# 最近笔记批量摘要（列表 + 单篇关键数据汇总）
+opencli xiaohongshu creator-notes-summary -f yaml
+```
+
+#### 其他读取
+
+```bash
+opencli xiaohongshu liked           # 赞过笔记列表
+opencli xiaohongshu saved           # 收藏笔记列表
+opencli xiaohongshu notifications   # 通知（mentions / likes / connections）
+opencli xiaohongshu ask "query"     # 向小红书点点提问，返回引用来源
+opencli xiaohongshu download NOTE_ID  # 下载笔记中的图片和视频
+opencli xiaohongshu drafts          # 本地草稿箱列表
+opencli xiaohongshu draft-open ID   # 读某条草稿详情
+```
+
+#### 写操作（谨慎使用，可能触发风控或封号）
+
+```bash
+opencli xiaohongshu publish "content"   # 发布图文笔记（creator center UI automation）
+opencli xiaohongshu follow USER_ID      # 关注用户（profile UI automation）
+opencli xiaohongshu unfollow USER_ID    # 取消关注
+opencli xiaohongshu delete-note NOTE_ID # 删除已发布笔记
+opencli xiaohongshu login               # 触发登录，等浏览器会话认证
 ```
 
 > 要求 Chrome 打开且装了 OpenCLI 扩展。报 AUTH_REQUIRED 说明浏览器里没登录小红书，让用户在 Chrome 里登录一次即可。
+> 写操作（发布/关注/删除）走 UI 自动化，速度较慢且有被风控风险，仅建议只读使用。
 
 ### 后端 B：xiaohongshu-mcp（服务器场景）
 
