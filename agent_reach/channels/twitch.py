@@ -1,42 +1,48 @@
 # -*- coding: utf-8 -*-
-"""Twitch — Helix API for users, streams, videos, and games.
+"""Twitch — 私有 GraphQL API (gql.twitch.tv/gql) 抓取用户/直播/视频/游戏。
 
-需要 Client ID + Client Secret（OAuth Client Credentials flow）。
-获取方式：https://dev.twitch.tv/console/apps 注册 Application → 拿到 Client ID/Secret。
+不走官方 Helix OAuth 流程。直接借用 Twitch Web 客户端的 Client-ID 调私有 GQL，
+无需用户申请任何凭证、无需登录账号。
 
-环境变量：
-  TWITCH_CLIENT_ID
-  TWITCH_CLIENT_SECRET
+Client-ID 来源：Twitch Web 前端 bundle 公开可见（任何浏览器 DevTools 都能看到）。
+注意：Twitch 偶尔会轮换此 ID，doctor 会自动验证可用性；不可用时给用户明确提示。
 
-Tier 1 — 需免费 key。Token 自动缓存到 ~/.agent-reach/twitch_token.json。
+风险与合规：
+  - 这违反 Twitch 服务条款（ToS § "Abuse of Twitch Services"），仅建议只读、
+    低频、个人学习使用。批量抓取可能触发 IP 限流或账号要求。
+  - 公开数据，无个人隐私暴露。
+  - 商业用途请走官方 Helix API。
+
+Tier 0 — 零配置。
 """
 
 import json
-import os
-import time
 import urllib.request
-import urllib.parse
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .base import Channel
 
-_UA = "agent-reach/1.0 (twitch channel)"
-_TIMEOUT = 10
-_BASE = "https://api.twitch.tv/helix"
-_TOKEN_URL = "https://id.twitch.tv/oauth2/token"
-_TOKEN_CACHE = Path.home() / ".agent-reach" / "twitch_token.json"
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+_TIMEOUT = 15
+_GQL_URL = "https://gql.twitch.tv/gql"
+
+# Twitch Web 前端的 Client-ID（公开可见，硬编码于 web bundle）。
+# 如果 Twitch 轮换，doctor 会自动发现并提示用户更新。
+_DEFAULT_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 
 
-def _post_form(url: str, data: dict) -> Any:
-    """POST application/x-www-form-urlencoded. Returns parsed JSON."""
-    body = urllib.parse.urlencode(data).encode("utf-8")
+def _post_gql(client_id: str, query: str, variables: Dict[str, Any] = None) -> Any:
+    """POST to Twitch GQL, return parsed JSON."""
+    body = json.dumps(
+        {"query": query, "variables": variables or {}}
+    ).encode("utf-8")
     req = urllib.request.Request(
-        url,
+        _GQL_URL,
         data=body,
         headers={
             "User-Agent": _UA,
-            "Content-Type": "application/x-www-form-urlencoded",
+            "Client-ID": client_id,
+            "Content-Type": "application/json",
         },
         method="POST",
     )
@@ -44,25 +50,15 @@ def _post_form(url: str, data: dict) -> Any:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _get_json(url: str, client_id: str, token: str) -> Any:
-    """Authenticated GET."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": _UA,
-            "Authorization": f"Bearer {token}",
-            "Client-Id": client_id,
-        },
-    )
-    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 class TwitchChannel(Channel):
     name = "twitch"
-    description = "Twitch 用户、直播、视频与游戏搜索"
-    backends = ["Twitch Helix API"]
-    tier = 1
+    description = "Twitch 用户、直播、视频与游戏（私有 GQL，无凭证）"
+    backends = ["Twitch GQL (anon)"]
+    tier = 0
+
+    # ------------------------------------------------------------------ #
+    # URL routing
+    # ------------------------------------------------------------------ #
 
     def can_handle(self, url: str) -> bool:
         from urllib.parse import urlparse
@@ -70,193 +66,294 @@ class TwitchChannel(Channel):
         return "twitch.tv" in d
 
     # ------------------------------------------------------------------ #
-    # Token management
-    # ------------------------------------------------------------------ #
-
-    def _get_token(self, client_id: str, client_secret: str) -> Optional[str]:
-        """Return cached or freshly-fetched app access token."""
-        # Try cache
-        if _TOKEN_CACHE.exists():
-            try:
-                cached = json.loads(_TOKEN_CACHE.read_text())
-                if cached.get("expires_at", 0) > time.time() + 60:
-                    return cached.get("token")
-            except Exception:
-                pass
-
-        # Fetch new
-        try:
-            data = _post_form(
-                _TOKEN_URL,
-                {
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "grant_type": "client_credentials",
-                },
-            )
-        except Exception:
-            return None
-
-        token = data.get("access_token")
-        if not token:
-            return None
-
-        # Cache (expires_in is seconds; default 3600)
-        _TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        _TOKEN_CACHE.write_text(
-            json.dumps(
-                {
-                    "token": token,
-                    "expires_at": time.time() + int(data.get("expires_in", 3600)),
-                }
-            )
-        )
-        return token
-
-    # ------------------------------------------------------------------ #
     # Health check
     # ------------------------------------------------------------------ #
 
     def check(self, config=None):  # noqa: ARG002
-        client_id = os.environ.get("TWITCH_CLIENT_ID")
-        client_secret = os.environ.get("TWITCH_CLIENT_SECRET")
-        if not client_id or not client_secret:
-            self.active_backend = None
-            return "warn", (
-                "Twitch 未配置。申请 Client ID/Secret：\n"
-                "  1. 打开 https://dev.twitch.tv/console/apps 注册 Application\n"
-                "  2. 设置环境变量：\n"
-                "       export TWITCH_CLIENT_ID=\"你的_client_id\"\n"
-                "       export TWITCH_CLIENT_SECRET=\"你的_client_secret\"\n"
-                "  3. 重跑 agent-reach doctor"
-            )
-
-        token = self._get_token(client_id, client_secret)
-        if not token:
-            self.active_backend = None
-            return "error", "Twitch OAuth 获取 token 失败（client_id/secret 错或网络不通）"
-
-        # Probe with a lightweight users call
         try:
-            _get_json(f"{_BASE}/users?login=twitch", client_id, token)
-            self.active_backend = self.backends[0]
-            return "ok", "Twitch Helix API 可用（用户/直播/视频/游戏搜索）。"
+            data = _post_gql(
+                _DEFAULT_CLIENT_ID,
+                "query { user(login: \"twitch\") { id login } }",
+                None,
+            )
+            if "errors" in data:
+                # Client-ID 可能被轮换
+                msg = data["errors"][0].get("message", "")
+                self.active_backend = None
+                return "error", (
+                    f"Twitch GQL 返回错误：{msg}。Client-ID 可能已被 Twitch 轮换，"
+                    "请从 Twitch Web DevTools 重新获取并修改 _DEFAULT_CLIENT_ID。"
+                )
+            user = data.get("data", {}).get("user")
+            if user and user.get("id"):
+                self.active_backend = self.backends[0]
+                return "ok", (
+                    "Twitch GQL 可用（用户、直播、视频、游戏搜索）。"
+                    "⚠️ 借用 Twitch Web 客户端 ID，违反 ToS，仅建议低频只读使用。"
+                )
+            self.active_backend = None
+            return "error", "Twitch GQL 返回结构异常"
         except Exception as e:
             self.active_backend = None
-            return "error", f"Twitch API 探测失败：{e}"
+            return "warn", f"Twitch GQL 连接失败（可能被 GFW 拦截）：{e}"
 
     # ------------------------------------------------------------------ #
     # Data methods
     # ------------------------------------------------------------------ #
 
-    def _auth(self):
-        cid = os.environ.get("TWITCH_CLIENT_ID", "")
-        sec = os.environ.get("TWITCH_CLIENT_SECRET", "")
-        token = self._get_token(cid, sec) if cid and sec else None
-        if not (cid and token):
-            raise RuntimeError("Twitch 未配置（设 TWITCH_CLIENT_ID + TWITCH_CLIENT_SECRET）")
-        return cid, token
-
     def get_user(self, login: str) -> Dict:
-        """按 login 查用户。"""
-        cid, token = self._auth()
-        url = f"{_BASE}/users?login={urllib.parse.quote(login)}"
+        """按 login 查用户。包含粉丝数、bio、profile_image 等。"""
+        q = (
+            "query($login: String!) {"
+            "  user(login: $login) {"
+            "    id login displayName description createdAt"
+            "    profileImageURL(width: 300)"
+            "    bannerImageURL"
+            "    followers { totalCount }"
+            "    roles { isPartner isAffiliate isStaff }"
+            "    channel { id }"
+            "  }"
+            "}"
+        )
         try:
-            data = _get_json(url, cid, token)
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"login": login})
         except Exception as e:
             return {"error": f"get_user failed: {e}"}
-        users = data.get("data") or []
-        if not users:
+        if "errors" in data:
+            return {"error": data["errors"][0].get("message", "GQL error")}
+        u = data.get("data", {}).get("user")
+        if not u:
             return {"error": f"user not found: {login}"}
-        u = users[0]
         return {
             "id": u.get("id", ""),
             "login": u.get("login", ""),
-            "display_name": u.get("display_name", ""),
-            "type": u.get("type", ""),
-            "broadcaster_type": u.get("broadcaster_type", ""),
+            "display_name": u.get("displayName", ""),
             "description": u.get("description", ""),
-            "profile_image_url": u.get("profile_image_url", ""),
-            "offline_image_url": u.get("offline_image_url", ""),
-            "view_count": u.get("view_count", 0),
-            "created_at": u.get("created_at", ""),
+            "created_at": u.get("createdAt", ""),
+            "profile_image_url": u.get("profileImageURL", ""),
+            "banner_image_url": u.get("bannerImageURL", ""),
+            "followers_count": (u.get("followers") or {}).get("totalCount", 0),
+            "is_partner": (u.get("roles") or {}).get("isPartner", False),
+            "is_affiliate": (u.get("roles") or {}).get("isAffiliate", False),
+            "is_staff": (u.get("roles") or {}).get("isStaff", False),
             "url": f"https://www.twitch.tv/{u.get('login', '')}",
         }
 
-    def get_streams(self, game_id: Optional[str] = None, user_login: Optional[str] = None,
-                    language: Optional[str] = None, first: int = 20) -> List[Dict]:
-        """获取直播流列表。可按 game_id / user_login / language 过滤。"""
-        cid, token = self._auth()
-        params: Dict[str, Any] = {"first": first}
-        if game_id: params["game_id"] = game_id
-        if user_login: params["user_login"] = user_login
-        if language: params["language"] = language
-        url = f"{_BASE}/streams?{urllib.parse.urlencode(params)}"
+    def get_streams(self, first: int = 20) -> List[Dict]:
+        """获取直播流列表（按 viewers 降序）。
+
+        注：Twitch GQL 的 streams 字段不接受任何 filter 参数（gameID / gameSlug /
+        language / channels 均报 Unknown argument）。Filter 只能在外层做：
+        先用 get_games() 拿到 game_id，再用 streams + gameID 不行；或者用
+        search_channels_for_game() 通过频道搜索间接过滤。
+        本方法返回的是全站热门直播榜。
+        """
+        q = (
+            "query($first: Int!) {"
+            "  streams(first: $first) {"
+            "    edges { node {"
+            "      id title viewersCount type createdAt"
+            "      game { id name slug boxArtURL(width: 285, height: 380) }"
+            "      broadcaster { id login displayName }"
+            "      previewImageURL(width: 320, height: 180)"
+            "    } }"
+            "  }"
+            "}"
+        )
         try:
-            data = _get_json(url, cid, token)
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"first": first})
         except Exception as e:
             return [{"error": f"get_streams failed: {e}"}]
+        if "errors" in data:
+            return [{"error": data["errors"][0].get("message", "GQL error")}]
         results = []
-        for s in (data.get("data") or []):
+        for edge in (data.get("data", {}).get("streams", {}) or {}).get("edges", []):
+            n = edge.get("node") or {}
+            broadcaster = n.get("broadcaster") or {}
+            game = n.get("game") or {}
             results.append({
-                "id": s.get("id", ""),
-                "user_id": s.get("user_id", ""),
-                "user_login": s.get("user_login", ""),
-                "user_name": s.get("user_name", ""),
-                "game_id": s.get("game_id", ""),
-                "game_name": s.get("game_name", ""),
-                "type": s.get("type", ""),
-                "title": s.get("title", ""),
-                "viewer_count": s.get("viewer_count", 0),
-                "started_at": s.get("started_at", ""),
-                "language": s.get("language", ""),
-                "thumbnail_url": s.get("thumbnail_url", "").replace("{width}", "320").replace("{height}", "180"),
-                "url": f"https://www.twitch.tv/{s.get('user_login', '')}",
+                "id": n.get("id") or "",
+                "title": n.get("title") or "",
+                "viewer_count": n.get("viewersCount") or 0,
+                "type": n.get("type") or "",
+                "started_at": n.get("createdAt") or "",
+                "broadcaster_id": broadcaster.get("id") or "",
+                "broadcaster_login": broadcaster.get("login") or "",
+                "broadcaster_display_name": broadcaster.get("displayName") or "",
+                "game_id": game.get("id") or "",
+                "game_name": game.get("name") or "",
+                "game_slug": game.get("slug") or "",
+                "game_box_art_url": game.get("boxArtURL") or "",
+                "preview_image_url": n.get("previewImageURL") or "",
+                "url": f"https://www.twitch.tv/{broadcaster.get('login') or ''}",
             })
         return results
 
-    def search_categories(self, query: str, first: int = 10) -> List[Dict]:
-        """搜游戏分类（categories = games on Twitch）。"""
-        cid, token = self._auth()
-        params = {"query": query, "first": first}
-        url = f"{_BASE}/search/categories?{urllib.parse.urlencode(params)}"
+    def search_users(self, query: str, first: int = 10) -> List[Dict]:
+        """按用户名搜索。query 是 userQuery（注意参数名是 userQuery 不是 query）。
+
+        通过 stream 字段是否非空判断 is_live。
+        """
+        q = (
+            "query($userQuery: String!, $first: Int!) {"
+            "  searchUsers(userQuery: $userQuery, first: $first) {"
+            "    edges { node {"
+            "      id login displayName description"
+            "      profileImageURL(width: 150)"
+            "      followers { totalCount }"
+            "      stream { id }"
+            "    } }"
+            "  }"
+            "}"
+        )
         try:
-            data = _get_json(url, cid, token)
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"userQuery": query, "first": first})
         except Exception as e:
-            return [{"error": f"search_categories failed: {e}"}]
+            return [{"error": f"search_users failed: {e}"}]
+        if "errors" in data:
+            return [{"error": data["errors"][0].get("message", "GQL error")}]
         results = []
-        for c in (data.get("data") or []):
+        for edge in (data.get("data", {}).get("searchUsers", {}) or {}).get("edges", []):
+            n = edge.get("node") or {}
             results.append({
-                "id": c.get("id", ""),
-                "name": c.get("name", ""),
-                "box_art_url": (c.get("box_art_url") or "").replace("{width}", "285").replace("{height}", "380"),
+                "id": n.get("id") or "",
+                "login": n.get("login") or "",
+                "display_name": n.get("displayName") or "",
+                "description": n.get("description") or "",
+                "profile_image_url": n.get("profileImageURL") or "",
+                "followers_count": (n.get("followers") or {}).get("totalCount") or 0,
+                "is_live": n.get("stream") is not None,
+                "url": f"https://www.twitch.tv/{n.get('login') or ''}",
             })
         return results
 
-    def get_videos(self, user_id: str, first: int = 10, sort: str = "time") -> List[Dict]:
-        """获取用户视频(VOD)。sort: time / views / trending"""
-        cid, token = self._auth()
-        params = {"user_id": user_id, "first": first, "sort": sort, "type": "archive"}
-        url = f"{_BASE}/videos?{urllib.parse.urlencode(params)}"
+    def get_games(self, first: int = 20) -> List[Dict]:
+        """获取热门游戏分类（默认按观众数降序）。"""
+        q = (
+            "query($first: Int!) {"
+            "  games(first: $first) {"
+            "    edges { node {"
+            "      id name slug viewersCount boxArtURL(width: 285, height: 380)"
+            "    } }"
+            "  }"
+            "}"
+        )
         try:
-            data = _get_json(url, cid, token)
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"first": first})
+        except Exception as e:
+            return [{"error": f"get_games failed: {e}"}]
+        if "errors" in data:
+            return [{"error": data["errors"][0].get("message", "GQL error")}]
+        results = []
+        for edge in (data.get("data", {}).get("games", {}) or {}).get("edges", []):
+            n = edge.get("node") or {}
+            results.append({
+                "id": n.get("id", ""),
+                "name": n.get("name", ""),
+                "slug": n.get("slug", ""),
+                "viewer_count": n.get("viewersCount", 0),
+                "box_art_url": n.get("boxArtURL", ""),
+            })
+        return results
+
+    def get_videos(self, login: str, first: int = 10) -> List[Dict]:
+        """获取用户视频(VOD)，按发布时间降序。"""
+        q = (
+            "query($login: String!, $first: Int!) {"
+            "  user(login: $login) {"
+            "    id login displayName"
+            "    videos(first: $first) {"
+            "      edges { node {"
+            "        id title viewCount lengthSeconds createdAt publishedAt"
+            "        previewThumbnailURL(width: 320, height: 180)"
+            "        game { id name }"
+            "      } }"
+            "    }"
+            "  }"
+            "}"
+        )
+        try:
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"login": login, "first": first})
         except Exception as e:
             return [{"error": f"get_videos failed: {e}"}]
+        if "errors" in data:
+            return [{"error": data["errors"][0].get("message", "GQL error")}]
+        user = data.get("data", {}).get("user")
+        if not user:
+            return [{"error": f"user not found: {login}"}]
         results = []
-        for v in (data.get("data") or []):
+        for edge in (user.get("videos", {}) or {}).get("edges", []):
+            n = edge.get("node") or {}
+            game = n.get("game") or {}
             results.append({
-                "id": v.get("id", ""),
-                "user_id": v.get("user_id", ""),
-                "user_login": v.get("user_login", ""),
-                "user_name": v.get("user_name", ""),
-                "title": v.get("title", ""),
-                "description": v.get("description", ""),
-                "created_at": v.get("created_at", ""),
-                "published_at": v.get("published_at", ""),
-                "url": v.get("url", ""),
-                "thumbnail_url": (v.get("thumbnail_url") or "").replace("%{width}", "320").replace("%{height}", "180"),
-                "view_count": v.get("view_count", 0),
-                "duration": v.get("duration", ""),
-                "type": v.get("type", ""),
+                "id": n.get("id", ""),
+                "title": n.get("title", ""),
+                "view_count": n.get("viewCount", 0),
+                "length_seconds": n.get("lengthSeconds", 0),
+                "created_at": n.get("createdAt", ""),
+                "published_at": n.get("publishedAt", ""),
+                "thumbnail_url": n.get("previewThumbnailURL", ""),
+                "game_id": game.get("id", ""),
+                "game_name": game.get("name", ""),
             })
         return results
+
+    def get_top_games(self, first: int = 10, after: Optional[str] = None) -> List[Dict]:
+        """Top games 排行（支持分页）。
+
+        after: pagination cursor（上一页最后一条的 cursor）。
+        """
+        q = (
+            "query($first: Int!, $after: Cursor) {"
+            "  gameDirectoryPage(first: $first, after: $after) {"
+            "    edges { cursor node {"
+            "      id name slug viewersCount boxArtURL(width: 285, height: 380)"
+            "    } }"
+            "    pageInfo { hasNextPage endCursor }"
+            "  }"
+            "}"
+        )
+        try:
+            data = _post_gql(_DEFAULT_CLIENT_ID, q, {"first": first, "after": after})
+        except Exception as e:
+            return [{"error": f"get_top_games failed: {e}"}]
+        if "errors" in data:
+            return [{"error": data["errors"][0].get("message", "GQL error")}]
+        page = data.get("data", {}).get("gameDirectoryPage", {}) or {}
+        results = []
+        for edge in (page.get("edges") or []):
+            n = edge.get("node") or {}
+            results.append({
+                "id": n.get("id", ""),
+                "name": n.get("name", ""),
+                "slug": n.get("slug", ""),
+                "viewer_count": n.get("viewersCount", 0),
+                "box_art_url": n.get("boxArtURL", ""),
+                "cursor": edge.get("cursor", ""),
+            })
+        return results
+
+    # ------------------------------------------------------------------ #
+    # URL-based reader
+    # ------------------------------------------------------------------ #
+
+    def read(self, url: str) -> Dict:
+        """Read a Twitch URL: channel page or video page.
+
+        https://www.twitch.tv/{login}            -> user profile
+        https://www.twitch.tv/videos/{video_id}  -> video metadata
+        """
+        from urllib.parse import urlparse
+
+        parts = [p for p in urlparse(url).path.split("/") if p]
+        if not parts:
+            return {"error": f"unsupported Twitch URL: {url}"}
+        # /videos/{id}
+        if parts[0] == "videos" and len(parts) >= 2:
+            return {
+                "error": "video metadata 需要额外 GQL 调用（video(id)），本方法未实现",
+                "video_id": parts[1],
+                "url": url,
+            }
+        # /{login} (channel page)
+        return self.get_user(parts[0])
