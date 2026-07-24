@@ -8,6 +8,7 @@ headless browser) takes over. xhs-cli (upstream unmaintained since
 2026-03) keeps working for existing installs as the last candidate.
 """
 
+import json
 import urllib.error
 import urllib.request
 
@@ -156,6 +157,113 @@ class XiaoHongShuChannel(Channel):
         from urllib.parse import urlparse
         d = urlparse(url).netloc.lower()
         return "xiaohongshu.com" in d or "xhslink.com" in d
+
+    # ------------------------------------------------------------------
+    # Public data methods
+    # ------------------------------------------------------------------
+
+    def search(self, query: str, limit: int = 20) -> dict:
+        """Search XHS notes by keyword using the active backend."""
+        return self._call_backend("search", query=query, limit=limit)
+
+    def note(self, note_id_or_url: str) -> dict:
+        """Fetch a single XHS note by id or URL."""
+        return self._call_backend("note", note_id=note_id_or_url)
+
+    def user(self, user_id_or_url: str) -> dict:
+        """Fetch a XHS user's public notes/profile by id or URL."""
+        return self._call_backend("user", user_id=user_id_or_url)
+
+    def comments(self, note_id: str) -> dict:
+        """Fetch comments for a XHS note."""
+        return self._call_backend("comments", note_id=note_id)
+
+    def _call_backend(self, action: str, **kwargs) -> dict:
+        """Route to the first usable backend."""
+        last_error: dict | None = None
+        for backend in self.ordered_backends():
+            if backend == "OpenCLI":
+                result = self._opencli_call(action, **kwargs)
+            elif backend == "xiaohongshu-mcp":
+                result = self._mcp_call(action, **kwargs)
+            else:
+                result = self._xhs_cli_call(action, **kwargs)
+            if result is not None and "error" not in result:
+                return result
+            if result is not None:
+                last_error = result  # keep last error; try next backend
+        return last_error if last_error is not None else {"error": "no usable XHS backend"}
+
+    def _opencli_call(self, action: str, **kwargs) -> dict | None:
+        from agent_reach.backends import opencli_status
+
+        if not opencli_status().installed:
+            return None
+        base = ["opencli", "xiaohongshu", action]
+        if action == "search":
+            base += [kwargs.get("query", ""), "--limit", str(kwargs.get("limit", 20))]
+        elif action in ("note", "user", "comments"):
+            ident = kwargs.get("note_id") or kwargs.get("user_id") or kwargs.get("note_id_or_url") or kwargs.get("user_id_or_url") or ""
+            if not ident:
+                return {"error": f"missing id argument for {action}"}
+            base += [str(ident)]
+        base += ["-f", "yaml"]
+        probe = probe_command(base[0], base[1:], timeout=30, package="@jackwener/opencli")
+        if not probe.output:
+            return None
+        return self._parse_cli_output(probe.output)
+
+    def _xhs_cli_call(self, action: str, **kwargs) -> dict | None:
+        ident = kwargs.get("query") or kwargs.get("note_id") or kwargs.get("user_id") or ""
+        if not ident:
+            return {"error": f"missing argument for {action}"}
+        probe = probe_command("xhs", [action, str(ident)], timeout=30, package="xiaohongshu-cli")
+        if probe.status == "missing":
+            return None
+        if not probe.output:
+            return {"error": "xhs-cli returned empty output"}
+        return self._parse_cli_output(probe.output)
+
+    def _mcp_call(self, action: str, **kwargs) -> dict | None:
+        if not _mcp_service_reachable():
+            return None
+        # Map action to xiaohongshu-mcp tool names
+        tool_map = {
+            "search": "search_feeds",
+            "note": "get_feed_detail",
+            "user": "get_user_notes",
+            "comments": "get_feed_comments",
+        }
+        tool = tool_map.get(action)
+        if not tool:
+            return None
+        arg_payload = json.dumps(kwargs, ensure_ascii=False)
+        cmd = f"xiaohongshu.{tool}({arg_payload})"
+        probe = probe_command("mcporter", ["call", cmd], timeout=30, package="mcporter")
+        if probe.status == "missing":
+            return None
+        return self._parse_cli_output(probe.output)
+
+    @staticmethod
+    def _parse_cli_output(text: str) -> dict:
+        """Parse YAML/JSON CLI output, falling back to raw text."""
+        # Skip leading log lines and try JSON first
+        cleaned = text.strip()
+        if "---" in cleaned:
+            # YAML documents: try last doc (the actual result)
+            docs = [d.strip() for d in cleaned.split("---") if d.strip()]
+            cleaned = docs[-1]
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+        try:
+            import yaml
+
+            data = yaml.safe_load(cleaned)
+            return data if data is not None else {"raw": text}
+        except Exception:
+            return {"raw": text}
 
     def check(self, config=None):
         """Probe candidates in order; first fully-usable backend wins.
