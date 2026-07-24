@@ -8,6 +8,7 @@ Tier 0，零配置。
 """
 
 import json
+import urllib.error
 import urllib.request
 import urllib.parse
 from typing import Any, Dict, List
@@ -67,15 +68,30 @@ class BlueskyChannel(Channel):
         Returns list of dicts:
           uri, cid, author_handle, author_display_name, text, created_at,
           like_count, reply_count, repost_count, quote_count, indexed_at, url
+
+        Retry policy: BSky 的反爬偶尔返回 403（IP 限流），加 2 次重试 + 指数退避。
         """
         url = (
             f"{_BASE}/app.bsky.feed.searchPosts"
             f"?q={urllib.parse.quote(query)}&limit={limit}"
         )
-        try:
-            data = _get_json(url)
-        except Exception as e:
-            return [{"error": f"search_posts failed: {e}"}]
+        last_error = None
+        for attempt in range(3):
+            try:
+                data = _get_json(url)
+                break
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}: {e.reason}"
+                if e.code == 403 and attempt < 2:
+                    # 风控临时封禁，等 2-4-8 秒重试
+                    import time as _time
+                    _time.sleep(2 ** (attempt + 1))
+                    continue
+                return [{"error": f"search_posts failed: {last_error}"}]
+            except Exception as e:
+                return [{"error": f"search_posts failed: {e}"}]
+        else:
+            return [{"error": f"search_posts failed after 3 retries: {last_error}"}]
         results = []
         for p in (data.get("posts") or []):
             author = p.get("author") or {}
